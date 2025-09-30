@@ -4,7 +4,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
-from src.models.ostrich_configuration import OstrichModelConfig
+from src.models.ostrich.ostrich_configuration import OstrichModelConfig
 from transformers import PreTrainedModel
 from transformers.models.qwen3 import Qwen3ForTokenClassification
 from typing import Tuple
@@ -53,37 +53,62 @@ def repeat_kv(x: torch.Tensor, n_rep: int):
 
 
 
-def precompute_freq_cis(max_seq_length, dim, theta: float = 10000.0):
-    # 维度频率计算
-    freqs = 1.0 / theta ** (torch.arange(0, dim, 2)[: dim // 2] / dim).float()
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    # torch.arange(0, dim, 2)[: (dim // 2)].float()生成了一个从0开始，步长为2的序列，长度为dim的一半
+    # 然后每个元素除以dim，再取theta的倒数，得到频率
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # 生成一个从0到end的序列，长度为end
+    t = torch.arange(end, device=freqs.device)
+    # 计算外积，得到一个二维矩阵，每一行是t的元素乘以freqs的元素
+    freqs = torch.outer(t, freqs).float()
+    # 计算频率的余弦值，得到实部
+    freqs_cos = torch.cos(freqs)
+    # 计算频率的正弦值，得到虚部
+    freqs_sin = torch.sin(freqs)
+    return freqs_cos, freqs_sin
 
-    # 生成 序列index,
-    t = torch.arange(0, max_seq_length).type_as(freqs)
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    # 获取x的维度数
+    ndim = x.ndim
+    
+    # 断言，确保1在x的维度范围内
+    assert 0 <= 1 < ndim
+    
+    # 断言，确保freqs_cis的形状与x的第二维和最后一维相同
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    
+    # 构造一个新的形状，除了第二维和最后一维，其他维度都为1，这样做是为了能够将freqs_cis与x进行广播操作
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    
+    # 将freqs_cis调整为新的形状，并返回
+    return freqs_cis.view(shape)
 
-    # 外积计算
-    freqs = torch.outer(t, freqs)  # seq_len, dim // 2
-
-    # 计算 大小为1 方向为theta的旋转矩阵 即转为复数域
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return freqs_cis
-
-
-def apply_rope_embedding(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # bsz, seq_len, dim => bsz , seq_len, dim//2 2
-    # 按照维度进行22分组，x y
-    xq_ = xq.reshape(*xq.shape[:-1], -1, 2)
-    xk_ = xk.reshape(*xk.shape[:-1], -1, 2)
 
-    # 转为复数 构建为x+iy
-    xq_ = torch.view_as_complex(xq_)
-    xk_ = torch.view_as_complex(xk_)
+    # 将查询和键张量转换为浮点数，并重塑形状以分离实部和虚部
+    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
 
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2).type_as(xq)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2).type_as(xk)
-    return xq_out, xk_out
+    # 重新塑形频率张量以进行广播
+    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
+    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
 
+    # 应用旋转，分别计算旋转后的实部和虚部
+    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+
+    # 将最后两个维度合并，并还原为原始张量的形状
+    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
+    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 class Attention(nn.Module):
     def __init__(self, args: OstrichModelConfig) -> None:
@@ -112,20 +137,18 @@ class Attention(nn.Module):
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        freq_cis = precompute_freq_cis(args.max_seq_len, dim=self.head_dim)
-        self.register_buffer("freq_cis", freq_cis)
         self.dropout_prob = args.dropout
 
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if self.flash:
-            # 若不支持，则手动mask
+        if not self.flash:
+            # 若不支持flash attention，则手动创建mask
             mask = torch.full(
                 (1, 1, args.max_seq_len, args.max_seq_len), fill_value=float("-inf")
             )
             mask = torch.triu(mask, diagonal=1)
             self.register_buffer("mask", mask)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
         bsz, seq_len = x.shape[:2]
 
         xq = self.wq(x)
@@ -134,6 +157,12 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(
+            xq,
+            xk,
+            freqs_cos,freqs_sin
+        )  # pyright: ignore[reportArgumentType, reportIndexIssue]
+        # 计算 scores
         xv = repeat_kv(xv, self.n_reps)
         xk = repeat_kv(xk, self.n_reps)
         # transpose
@@ -141,14 +170,7 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        xq, xk = apply_rope_embedding(
-            xq,
-            xk,
-            self.freq_cis[  # pyright: ignore[reportArgumentType, reportIndexIssue]
-                :seq_len, :
-            ],  # pyright: ignore[reportArgumentType, reportIndexIssue]
-        )  # pyright: ignore[reportArgumentType, reportIndexIssue]
-        # 计算 scores
+       
 
         if self.flash:
             output = torch.nn.functional.scaled_dot_product_attention(
@@ -214,8 +236,8 @@ class DecoderLayer(nn.Module):
         )
         self.dropout = nn.Dropout(args.dropout)
 
-    def forward(self, x):
-        x = x + self.attn(self.attn_norm(x))
+    def forward(self, x, freqs_cos, freqs_sin):
+        x = x + self.attn(self.attn_norm(x), freqs_cos, freqs_sin)
         x = x + self.feed_forward(self.ffn_norm(x))
         return self.dropout(x)
 
@@ -223,12 +245,12 @@ class DecoderLayer(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, args: OstrichModelConfig) -> None:
         super().__init__()
-        self.layers = [DecoderLayer(args) for _ in range(args.n_layers)]
+        self.layers = nn.ModuleList([DecoderLayer(args) for _ in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, args.norm_eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, freqs_cos, freqs_sin) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, freqs_cos, freqs_sin)
         return self.norm(x)
 
 
@@ -248,6 +270,12 @@ class OstrichModel(PreTrainedModel):
         self.decoder = Decoder(config)
 
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.dim // config.n_heads, config.max_seq_len)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
         self.apply(self._init_weights)
         for param_name, param in self.named_parameters():
             if param_name.endswith("wo.weight") or param_name.endswith("w3.weight"):
@@ -272,11 +300,15 @@ class OstrichModel(PreTrainedModel):
             tokens = kwargs["input_ids"]
         if "attention_mask" in kwargs:
             targets = kwargs["attention_mask"]
+        bsz, seq_len = tokens.shape[:2]
 
         token_embeds = self.embed(tokens)
         token_embeds = self.embed_dropout(token_embeds)
+        # 获取相对位置嵌入的频率
+        freqs_cos = self.freqs_cos[:seq_len] # type: ignore
+        freqs_sin = self.freqs_sin[:seq_len] # type: ignore
 
-        decoder_out = self.decoder(token_embeds)
+        decoder_out = self.decoder(token_embeds, freqs_cos, freqs_sin)
         if targets is not None:
             logits = self.output(decoder_out)
             self.last_loss = F.cross_entropy(
@@ -286,10 +318,10 @@ class OstrichModel(PreTrainedModel):
                 reduction="none",
             )
         else:
-            logitis = self.output(decoder_out[:, [-1], :])
+            logits = self.output(decoder_out[:, [-1], :])
             self.last_loss = None
 
-        return CausalLMOutputWithPast(loss=self.last_loss, logits=logitis) # type: ignore
+        return CausalLMOutputWithPast(loss=self.last_loss, logits=logits) # type: ignore
 
     @torch.inference_mode()
     def generator(
